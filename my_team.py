@@ -426,8 +426,16 @@ class TeamContext:
         elif total > self.progress_total:
             self.last_progress = timeleft
         self.progress_total = total
-        if any(game_state.get_agent_state(e).is_pacman for e in self.enemies):
+        hop = agent.p('quiet_hop', 0)
+        for e in self.enemies:
+            st = game_state.get_agent_state(e)
+            if not st.is_pacman:
+                continue
+            p = as_cell(st.get_position())
+            if hop and st.num_carrying == 0 and p is not None and self.maze.enemy_home_dist[p] <= hop:
+                continue  # an empty-handed enemy hopping over the border line and back
             self.last_enemy_invasion = timeleft
+            break
         self.tracker.observe(game_state, agent.index, self.team)
 
     def chase_table(self, side, capsules):
@@ -593,6 +601,13 @@ class PlannerAgent(BaseAgent):
         if self.p('stall_window', 0):
             self.check_stall(gs, pos)
         self.goal = None
+        run = self.breakout_step(gs, pos)
+        if run is not None:
+            self.last_goal = self.goal
+            self.history.append(pos)
+            if len(self.history) > 8:
+                self.history.pop(0)
+            return action_towards(pos, run) if run != pos else self.fallback_action(gs, pos, legal)
         if self.role == 'attack':
             target = self.attack_target(gs, pos)
             if self.p('unstick', False) and self.oscillating(pos, target):
@@ -615,6 +630,57 @@ class PlannerAgent(BaseAgent):
         if target is None or target == pos:
             return self.fallback_action(gs, pos, legal)
         return action_towards(pos, target)
+
+    def breakout_step(self, gs, pos):
+        """A pacman boxed in for a long time: it has stood within a few cells for
+        `breakout` moves (typically a ghost parked at the only way out, which never
+        comes in for it). Waiting gains nothing for the rest of the game, so it runs
+        home along the route that stays farthest from the ghosts, even if that means
+        being caught: respawning at home beats standing still. Sooner
+        (`breakout_urgent` moves) when an invader is on our side and no teammate is
+        at home to stop it. Returns the next cell, or None."""
+        n = self.p('breakout', 0)
+        maze = self.maze
+        if not n or pos in maze.home_cells:
+            self.box_trail, self.breaking = [], False
+            return None
+        if not hasattr(self, 'box_trail'):
+            self.box_trail, self.breaking = [], False
+        trail = self.box_trail
+        trail.append(pos)
+        urgent = self.p('breakout_urgent', 0)
+        hurry = False
+        if urgent:
+            mate = as_cell(gs.get_agent_position(self.teammate))
+            mate_home = mate in maze.home_cells and gs.get_agent_state(self.teammate).scared_timer == 0
+            if not mate_home and any(gs.get_agent_state(e).is_pacman for e in self.ctx.enemies):
+                n = min(n, urgent)
+                hurry = True
+        if len(trail) > self.p('breakout', 0):
+            trail.pop(0)
+        # Ahead, a standoff ties up one of theirs as much as one of ours and keeps the
+        # lead; only an invader eating at home makes it worth breaking up.
+        if self.score(gs) > self.p('breakout_lead', 1000) and not hurry:
+            self.breaking = False
+            return None
+        if not self.breaking:
+            recent = trail[-n:]
+            if len(recent) < n or len(set(recent)) > self.p('breakout_cells', 3):
+                return None
+            self.breaking = True
+        ghosts = [g for _, g in self.dangerous_ghosts(gs)]
+
+        def cost(c, s):
+            if c in maze.home_cells or not ghosts:
+                return 0.0
+            gd = min(maze.dist(g, c) for g in ghosts)
+            if gd <= 1:
+                return 30.0
+            return 6.0 / gd if gd <= 3 else 0.0
+        dist, _, parent = dijkstra(maze.nbrs, pos, cost)
+        goal = min(maze.border, key=lambda b: (dist.get(b, INF), b))
+        self.goal = goal
+        return first_step(parent, pos, goal)
 
     def check_stall(self, gs, pos):
         """An attacker walking in a small loop (e.g. a ghost keeps blocking the way
@@ -848,6 +914,11 @@ class PlannerAgent(BaseAgent):
         for threshold in (self.p('risk_t1', 0), self.p('risk_t2', 0)):
             if moves_left < threshold:
                 level += 1
+        # ... and when the team has gained nothing for a long time (a guard parked
+        # where we need to go): waiting will not get any better either.
+        stall = self.p('stall_risk', 0)
+        if stall:
+            level = max(level, min(2, self.ctx.stalled_moves(gs) // stall))
         return level
 
     def danger_cost(self, ghost_pos, gs=None, pos=None, late=()):
@@ -897,12 +968,20 @@ class PlannerAgent(BaseAgent):
         preferring cells that are not dead ends and are closer to home."""
         maze = self.maze
         best, best_val = pos, -INF
+        # Two of us fleeing the same ghost into the same corner get caught together:
+        # keep away from a teammate that is also a pacman.
+        spread = self.p('escape_spread', 0)
+        mate = as_cell(gs.get_agent_position(self.teammate)) if spread else None
+        if mate is not None and not gs.get_agent_state(self.teammate).is_pacman:
+            mate = None
         for n in maze.nbrs[pos] + [pos]:
             gd = min([maze.dist(g, n) for g in ghost_pos] or [20])
             if gd <= 1 and n not in maze.home_cells:
                 val = -1000 + gd
             else:
                 val = min(gd, 6) * 10 - maze.depth[n] * 3 - maze.home_dist[n]
+                if mate is not None:
+                    val -= spread * max(0, 4 - maze.dist(n, mate))
             if n in maze.home_cells:
                 val += 50
             if val > best_val:
@@ -1186,7 +1265,9 @@ def _parse_value(v):
 
 # The team that plays when no options are given (the contest passes none).
 DEFAULT_STRATEGY = 'planner'
-DEFAULT_PARAMS = {'unstick': True, 'risk_t1': 150, 'risk_t2': 60, 'capsule_first': True, 'carry_limit': 12, 'stall_window': 16, 'open_stall': 60, 'heavy_defend': 8, 'scared_raid': 10}
+DEFAULT_PARAMS = {'unstick': True, 'risk_t1': 150, 'risk_t2': 60, 'capsule_first': True, 'carry_limit': 12, 'stall_window': 16, 'open_stall': 60, 'heavy_defend': 8, 'scared_raid': 10,
+                  'breakout': 12, 'breakout_urgent': 6, 'breakout_lead': 0, 'stall_risk': 60, 'quiet_hop': 2,
+                  'escape_spread': 10}
 
 
 def create_team(first_index, second_index, is_red, strategy=None, num_training=0, **params):
